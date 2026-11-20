@@ -1,2 +1,15 @@
-node_modules
+# Dependencies
+node_modules/
+
+# Secrets
 .env
+.env.*
+!.env.local
+
+# Vercel
+.vercel/
+
+# Logs and OS files
+*.log
+npm-debug.log*
+.DS_Store
