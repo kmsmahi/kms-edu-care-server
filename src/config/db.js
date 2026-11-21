@@ -27,6 +27,11 @@ const ensureIndexes = async () => {
       // A tutor can apply to a given tuition only once
       applications.createIndex({ tuitionId: 1, tutorEmail: 1 }, { unique: true }),
       applications.createIndex({ tutorEmail: 1 }),
+      // Only one Approved tutor per tuition (race-proof)
+      applications.createIndex(
+        { tuitionId: 1 },
+        { unique: true, partialFilterExpression: { status: "Approved" } }
+      ),
 
       // A Stripe payment can be recorded only once (idempotent confirmation)
       payments.createIndex({ paymentIntentId: 1 }, { unique: true }),
