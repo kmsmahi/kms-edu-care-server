@@ -1,10 +1,19 @@
-import { applications, payments, tuitions, toObjectId } from "../config/db.js";
+import {
+  applications,
+  connectDB,
+  payments,
+  tuitions,
+  toObjectId,
+} from "../config/db.js";
 import { getStripe } from "../config/stripe.js";
 import { asyncHandler } from "../middlewares/errorHandler.js";
 
 /* ------------------------------ Helpers ------------------------------ */
 
-const httpError = (status, message) => Object.assign(new Error(message), { status });
+const httpError = (status, message) =>
+  Object.assign(new Error(message), { status });
+
+const normalizeEmail = (value) => String(value ?? "").trim().toLowerCase();
 
 // Currencies Stripe treats as having no minor unit (amount is sent as-is)
 const ZERO_DECIMAL = new Set([
@@ -13,6 +22,13 @@ const ZERO_DECIMAL = new Set([
 ]);
 
 const PAYMENT_INTENT_ID = /^pi_[A-Za-z0-9_]+$/;
+
+const getCollections = async () => {
+  if (!applications || !payments || !tuitions) {
+    await connectDB();
+  }
+  return { applications, payments, tuitions };
+};
 
 /** Runs a Stripe call and converts Stripe errors into safe HTTP errors (never 401/403). */
 const stripeCall = async (fn) => {
@@ -34,11 +50,18 @@ const stripeCall = async (fn) => {
  * conversion is not configured, so nobody is ever charged the wrong amount.
  */
 const getChargeDetails = (salaryInBdt) => {
-  const currency = (process.env.PAYMENT_CURRENCY || "usd").toLowerCase();
+  const numericSalary = Number(salaryInBdt);
+  if (!Number.isFinite(numericSalary) || numericSalary <= 0) {
+    throw httpError(400, "Invalid tuition salary amount");
+  }
+
+  const currency = String(process.env.PAYMENT_CURRENCY || "usd")
+    .trim()
+    .toLowerCase();
   let rate = 1;
 
   if (currency !== "bdt") {
-    rate = Number(process.env.PAYMENT_EXCHANGE_RATE);
+    rate = Number(String(process.env.PAYMENT_EXCHANGE_RATE ?? "").trim());
     if (!Number.isFinite(rate) || rate <= 0) {
       throw httpError(
         500,
@@ -48,7 +71,7 @@ const getChargeDetails = (salaryInBdt) => {
   }
 
   const multiplier = ZERO_DECIMAL.has(currency) ? 1 : 100;
-  const amountMinor = Math.round((Number(salaryInBdt) / rate) * multiplier);
+  const amountMinor = Math.round((numericSalary / rate) * multiplier);
 
   if (!Number.isFinite(amountMinor) || amountMinor < (multiplier === 1 ? 1 : 50)) {
     throw httpError(400, "This amount is too small to be charged online");
@@ -84,25 +107,34 @@ const conflictAfterPayment = (paymentIntentId, status) =>
  * Returns { clientSecret, amount, currency } (amount in major units, for display).
  */
 export const createPaymentIntent = asyncHandler(async (req, res) => {
+  const {
+    applications: applicationsCol,
+    tuitions: tuitionsCol,
+  } = await getCollections();
   const stripe = getStripe();
 
   const applicationId = toObjectId(req.body?.applicationId);
-  if (!applicationId) return res.status(400).json({ message: "Invalid application id" });
+  if (!applicationId) {
+    return res.status(400).json({ message: "Invalid application id" });
+  }
 
-  const application = await applications.findOne({
+  const studentEmail = normalizeEmail(req.user?.email);
+  const application = await applicationsCol.findOne({
     _id: applicationId,
-    studentEmail: req.user.email,
+    studentEmail,
   });
-  if (!application) return res.status(404).json({ message: "Application not found" });
+  if (!application) {
+    return res.status(404).json({ message: "Application not found" });
+  }
 
   if (application.status !== "Pending") {
-    return res
-      .status(409)
-      .json({ message: `This application is already ${application.status.toLowerCase()}` });
+    return res.status(409).json({
+      message: `This application is already ${application.status.toLowerCase()}`,
+    });
   }
 
   const alreadyFilled =
-    (await applications.countDocuments(
+    (await applicationsCol.countDocuments(
       { tuitionId: application.tuitionId, status: "Approved" },
       { limit: 1 }
     )) > 0;
@@ -112,13 +144,15 @@ export const createPaymentIntent = asyncHandler(async (req, res) => {
       .json({ message: "A tutor has already been approved for this tuition" });
   }
 
-  const tuition = await tuitions.findOne(
+  const tuition = await tuitionsCol.findOne(
     { _id: application.tuitionId },
     { projection: { subject: 1 } }
   );
   if (!tuition) return res.status(404).json({ message: "Tuition not found" });
 
-  const { currency, amountMinor, amountMajor } = getChargeDetails(application.expectedSalary);
+  const { currency, amountMinor, amountMajor } = getChargeDetails(
+    application.expectedSalary
+  );
 
   // Reuse the open PaymentIntent (e.g. page refresh) instead of piling up new ones
   let intent = null;
@@ -150,14 +184,14 @@ export const createPaymentIntent = asyncHandler(async (req, res) => {
         metadata: {
           applicationId: String(application._id),
           tuitionId: String(application.tuitionId),
-          studentEmail: req.user.email,
-          tutorEmail: application.tutorEmail,
+          studentEmail,
+          tutorEmail: normalizeEmail(application.tutorEmail),
           expectedSalary: String(application.expectedSalary),
         },
       })
     );
 
-    await applications.updateOne(
+    await applicationsCol.updateOne(
       { _id: application._id },
       { $set: { pendingPaymentIntentId: intent.id } }
     );
@@ -177,28 +211,41 @@ export const createPaymentIntent = asyncHandler(async (req, res) => {
  * Safe to call again (idempotent): the PaymentIntent id is unique in `payments`.
  */
 export const confirmPayment = asyncHandler(async (req, res) => {
+  const {
+    applications: applicationsCol,
+    payments: paymentsCol,
+    tuitions: tuitionsCol,
+  } = await getCollections();
   const stripe = getStripe();
 
   const applicationId = toObjectId(req.body?.applicationId);
-  if (!applicationId) return res.status(400).json({ message: "Invalid application id" });
+  if (!applicationId) {
+    return res.status(400).json({ message: "Invalid application id" });
+  }
 
   const paymentIntentId = req.body?.paymentIntentId;
-  if (typeof paymentIntentId !== "string" || !PAYMENT_INTENT_ID.test(paymentIntentId)) {
+  if (
+    typeof paymentIntentId !== "string" ||
+    !PAYMENT_INTENT_ID.test(paymentIntentId)
+  ) {
     return res.status(400).json({ message: "Invalid payment reference" });
   }
 
-  const application = await applications.findOne({
+  const studentEmail = normalizeEmail(req.user?.email);
+  const application = await applicationsCol.findOne({
     _id: applicationId,
-    studentEmail: req.user.email,
+    studentEmail,
   });
-  if (!application) return res.status(404).json({ message: "Application not found" });
+  if (!application) {
+    return res.status(404).json({ message: "Application not found" });
+  }
 
   // Already processed? Return the saved payment instead of doing it twice
-  const recorded = await payments.findOne({ paymentIntentId });
+  const recorded = await paymentsCol.findOne({ paymentIntentId });
   if (recorded) {
     if (
       String(recorded.applicationId) === String(applicationId) &&
-      recorded.studentEmail === req.user.email
+      recorded.studentEmail === studentEmail
     ) {
       return res.json({
         message: "Payment already recorded",
@@ -206,19 +253,25 @@ export const confirmPayment = asyncHandler(async (req, res) => {
         payment: publicPayment(recorded),
       });
     }
-    return res.status(409).json({ message: "This payment has already been used" });
+    return res
+      .status(409)
+      .json({ message: "This payment has already been used" });
   }
 
   // 1) Ask Stripe, never trust the browser
-  const intent = await stripeCall(() => stripe.paymentIntents.retrieve(paymentIntentId));
+  const intent = await stripeCall(() =>
+    stripe.paymentIntents.retrieve(paymentIntentId)
+  );
 
   if (intent.status !== "succeeded") {
-    return res.status(409).json({ message: "The payment has not been completed yet" });
+    return res
+      .status(409)
+      .json({ message: "The payment has not been completed yet" });
   }
 
   if (
     intent.metadata?.applicationId !== String(application._id) ||
-    intent.metadata?.studentEmail !== req.user.email
+    normalizeEmail(intent.metadata?.studentEmail) !== studentEmail
   ) {
     return res
       .status(400)
@@ -230,7 +283,7 @@ export const confirmPayment = asyncHandler(async (req, res) => {
   if (application.status === "Pending") {
     let approved;
     try {
-      approved = await applications.findOneAndUpdate(
+      approved = await applicationsCol.findOneAndUpdate(
         { _id: application._id, status: "Pending" },
         {
           $set: { status: "Approved", approvedAt: now, paymentIntentId },
@@ -240,18 +293,23 @@ export const confirmPayment = asyncHandler(async (req, res) => {
       );
     } catch (error) {
       // Unique index: another tutor was approved for this tuition at the same moment
-      if (error.code === 11000) throw conflictAfterPayment(paymentIntentId, "filled");
+      if (error.code === 11000) {
+        throw conflictAfterPayment(paymentIntentId, "filled");
+      }
       throw error;
     }
     if (!approved) throw conflictAfterPayment(paymentIntentId, "changed");
   } else if (
-    !(application.status === "Approved" && application.paymentIntentId === paymentIntentId)
+    !(
+      application.status === "Approved" &&
+      application.paymentIntentId === paymentIntentId
+    )
   ) {
     throw conflictAfterPayment(paymentIntentId, application.status);
   }
 
   // 3) Record the payment
-  const tuition = await tuitions.findOne(
+  const tuition = await tuitionsCol.findOne(
     { _id: application.tuitionId },
     { projection: { subject: 1, studentName: 1 } }
   );
@@ -266,13 +324,14 @@ export const confirmPayment = asyncHandler(async (req, res) => {
     applicationId: application._id,
     tuitionId: application.tuitionId,
     tuitionSubject: tuition?.subject || "",
-    studentEmail: req.user.email,
+    studentEmail,
     studentName: tuition?.studentName || "",
-    tutorEmail: application.tutorEmail,
+    tutorEmail: normalizeEmail(application.tutorEmail),
     tutorName: application.tutorName,
     amount: paidMinor / multiplier,
     currency: currency.toUpperCase(),
-    expectedSalary: Number(intent.metadata?.expectedSalary) || application.expectedSalary,
+    expectedSalary:
+      Number(intent.metadata?.expectedSalary) || application.expectedSalary,
     status: "succeeded",
     paidAt: now,
     createdAt: now,
@@ -280,16 +339,20 @@ export const confirmPayment = asyncHandler(async (req, res) => {
 
   let saved = paymentDoc;
   try {
-    const result = await payments.insertOne(paymentDoc);
+    const result = await paymentsCol.insertOne(paymentDoc);
     saved = { ...paymentDoc, _id: result.insertedId };
   } catch (error) {
     if (error.code !== 11000) throw error;
-    saved = (await payments.findOne({ paymentIntentId })) || paymentDoc; // concurrent confirm
+    saved = (await paymentsCol.findOne({ paymentIntentId })) || paymentDoc; // concurrent confirm
   }
 
   // 4) Competing applicants for the same tuition are rejected
-  await applications.updateMany(
-    { tuitionId: application.tuitionId, _id: { $ne: application._id }, status: "Pending" },
+  await applicationsCol.updateMany(
+    {
+      tuitionId: application.tuitionId,
+      _id: { $ne: application._id },
+      status: "Pending",
+    },
     {
       $set: {
         status: "Rejected",
@@ -307,9 +370,10 @@ export const confirmPayment = asyncHandler(async (req, res) => {
 
 /** GET /api/payments/student: the student's payment history. */
 export const getStudentPayments = asyncHandler(async (req, res) => {
-  const items = await payments
+  const { payments: paymentsCol } = await getCollections();
+  const items = await paymentsCol
     .find(
-      { studentEmail: req.user.email },
+      { studentEmail: normalizeEmail(req.user?.email) },
       { projection: { studentEmail: 0, tutorEmail: 0, paymentIntentId: 0 } }
     )
     .sort({ paidAt: -1, _id: -1 })
@@ -322,9 +386,10 @@ export const getStudentPayments = asyncHandler(async (req, res) => {
 
 /** GET /api/payments/tutor: the tutor's revenue history. */
 export const getTutorPayments = asyncHandler(async (req, res) => {
-  const items = await payments
+  const { payments: paymentsCol } = await getCollections();
+  const items = await paymentsCol
     .find(
-      { tutorEmail: req.user.email },
+      { tutorEmail: normalizeEmail(req.user?.email) },
       { projection: { studentEmail: 0, tutorEmail: 0, paymentIntentId: 0 } }
     )
     .sort({ paidAt: -1, _id: -1 })

@@ -14,7 +14,7 @@ const app = express();
 app.disable("x-powered-by");
 
 /* ------------------------------- CORS ------------------------------- */
-// CLIENT_URL (comma-separated for several) + the local Vite dev origin
+// CLIENT_URL (comma-separated for several) + local Vite dev origins
 const normalizeOrigin = (origin) => String(origin).trim().replace(/\/+$/, "");
 
 const allowedOrigins = [
@@ -25,11 +25,24 @@ const allowedOrigins = [
   .map(normalizeOrigin)
   .filter(Boolean);
 
+// Allows local LAN testing on phones (e.g., http://192.168.x.x:5173) outside production
+const isLocalLanOrigin = (origin) => {
+  if (process.env.NODE_ENV === "production") return false;
+  return /^http:\/\/(192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+)(:\d+)?$/i.test(
+    origin
+  );
+};
+
 app.use(
   cors({
-    // No Origin header (curl, Postman, server-to-server) is allowed; browsers must match the list
-    origin: (origin, callback) =>
-      callback(null, !origin || allowedOrigins.includes(normalizeOrigin(origin))),
+    // No Origin header (curl, Postman, server-to-server) is allowed; browsers must match
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      const normalized = normalizeOrigin(origin);
+      const permitted =
+        allowedOrigins.includes(normalized) || isLocalLanOrigin(normalized);
+      return callback(null, permitted);
+    },
     methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     maxAge: 86400,
