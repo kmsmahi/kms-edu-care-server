@@ -2,8 +2,9 @@
 
 Backend REST API for **KMS EduCare**, built with **Node.js**, **Express**, **MongoDB**, **JWT**, **Firebase Admin / Token Verification**, and **Stripe**.
 
-- **Live API URL:** `[LIVE_API_URL]`
-- **Live Client URL:** `[LIVE_CLIENT_URL]`
+- **Live Server URL:** [https://kms-edu-care-server.vercel.app/](https://kms-edu-care-server.vercel.app/)
+- **Live API Base URL:** `https://kms-edu-care-server.vercel.app/api`
+- **Live Client URL:** [https://kms-edu-care.web.app/](https://kms-edu-care.web.app/)
 
 ---
 
