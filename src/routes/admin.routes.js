@@ -5,6 +5,7 @@ import {
   changeUserRole,
   deleteUser,
   getDashboardStats,
+  getOwnerStatus,
   getReports,
   listAllTuitions,
   listUsers,
@@ -25,6 +26,7 @@ router.get(
 /* Everything under /admin requires a logged-in admin (role re-checked in MongoDB) */
 router.use("/admin", verifyToken, verifyAdmin);
 
+router.get("/admin/owner-status", getOwnerStatus);
 router.get("/admin/users", listUsers);
 router.patch("/admin/users/:id/role", changeUserRole);
 router.patch("/admin/users/:id", updateUser);

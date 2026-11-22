@@ -46,12 +46,13 @@ export const upsertUser = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: "A valid email is required" });
   }
 
-  if (req.user && req.user.email !== email) {
+  const requesterEmail = normalizeEmail(req.user?.email);
+  if (requesterEmail && requesterEmail !== email) {
     return res
       .status(403)
       .json({ message: "You can only create your own profile" });
   }
-  if (!req.user && process.env.FIREBASE_PROJECT_ID) {
+  if (!requesterEmail && process.env.FIREBASE_PROJECT_ID) {
     return res
       .status(401)
       .json({ message: "Unauthorized: access token missing" });
@@ -72,13 +73,25 @@ export const upsertUser = asyncHandler(async (req, res) => {
       .json({ message: "Photo URL must be a valid http(s) link" });
   }
 
-  const role = SELF_SERVICE_ROLES.includes(body.role) ? body.role : "student";
+  const requestedRole = String(body.role ?? "").trim().toLowerCase();
+  const role = SELF_SERVICE_ROLES.includes(requestedRole)
+    ? requestedRole
+    : "student";
 
   let created = false;
   try {
     const result = await usersCol.updateOne(
       { email },
-      { $setOnInsert: { name, phone, photoUrl, role, createdAt: new Date() } },
+      {
+        $setOnInsert: {
+          email,
+          name,
+          phone,
+          photoUrl,
+          role,
+          createdAt: new Date(),
+        },
+      },
       { upsert: true }
     );
     created = result.upsertedCount > 0;
@@ -95,10 +108,11 @@ export const upsertUser = asyncHandler(async (req, res) => {
 export const getUserRole = asyncHandler(async (req, res) => {
   const usersCol = await getUsersCollection();
   const email = normalizeEmail(req.params.email);
-  const isSelf = email === req.user.email;
+  const requesterEmail = normalizeEmail(req.user?.email);
+  const isSelf = email === requesterEmail;
 
   const requester = await usersCol.findOne(
-    { email: req.user.email },
+    { email: requesterEmail },
     { projection: { role: 1 } }
   );
 
@@ -120,7 +134,7 @@ export const getUserRole = asyncHandler(async (req, res) => {
 /** GET /api/users/me: the logged-in user's profile. */
 export const getMyProfile = asyncHandler(async (req, res) => {
   const usersCol = await getUsersCollection();
-  const account = await usersCol.findOne({ email: req.user.email });
+  const account = await usersCol.findOne({ email: normalizeEmail(req.user?.email) });
   if (!account) return res.status(404).json({ message: "User not found" });
   return res.json(account);
 });
@@ -166,7 +180,7 @@ export const updateMyProfile = asyncHandler(async (req, res) => {
   }
 
   const updated = await usersCol.findOneAndUpdate(
-    { email: req.user.email },
+    { email: normalizeEmail(req.user?.email) },
     { $set: { ...updates, updatedAt: new Date() } },
     { returnDocument: "after" }
   );
